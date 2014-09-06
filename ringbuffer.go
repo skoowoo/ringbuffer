@@ -14,23 +14,26 @@ type Ring struct {
 	rpos    int32
 	wpos    int32
 	stop    int32
+	firstW  *Buffer
 }
 
-func NewRing(size, bsize int) *Ring {
+func NewRing(rsize, bsize int) *Ring {
 	r := new(Ring)
-	r.buffers = make([]*Buffer, size)
-	r.size = int32(size)
+	r.buffers = make([]*Buffer, rsize)
+	r.size = int32(rsize)
 	r.rpos = 0
 	r.wpos = 0
 	r.stop = 0
 
-	for i := 0; i < size; i++ {
+	for i := 0; i < rsize; i++ {
 		buf := newBuffer(bsize)
 		buf.index = int32(i)
 		buf.ring = r
 
 		r.buffers[i] = buf
 	}
+
+	r.firstW = r.prepareWrite()
 
 	return r
 }
@@ -78,10 +81,10 @@ func (r *Ring) Read(buf *Buffer) (e interface{}, next *Buffer) {
 }
 
 func (r *Ring) ExitRead(buf *Buffer) {
-    buf.exitGet()
+	buf.exitGet()
 }
 
-func (r *Ring) PrepareWrite() *Buffer {
+func (r *Ring) prepareWrite() *Buffer {
 	buffer := r.buffers[r.wpos]
 	buffer.preparePut()
 	return buffer
@@ -89,7 +92,7 @@ func (r *Ring) PrepareWrite() *Buffer {
 
 func (r *Ring) Write(buf *Buffer, e interface{}) *Buffer {
 	if buf == nil {
-		buf = r.PrepareWrite()
+		buf = r.firstW
 	}
 
 	for {
@@ -148,7 +151,7 @@ func (b *Buffer) finishGet() {
 }
 
 func (b *Buffer) exitGet() {
-    b.lock.RUnlock()
+	b.lock.RUnlock()
 }
 
 func (b *Buffer) get() (e interface{}) {
