@@ -1,0 +1,216 @@
+package ringbuffer
+
+import (
+	"errors"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type Ring struct {
+	buffers []*Buffer
+	size    int32
+	rpos    int32
+	wpos    int32
+	stop    int32
+}
+
+func NewRing(size, bsize int) *Ring {
+	r := new(Ring)
+	r.buffers = make([]*Buffer, size)
+	r.size = int32(size)
+	r.rpos = 0
+	r.wpos = 0
+	r.stop = 0
+
+	for i := 0; i < size; i++ {
+		buf := newBuffer(bsize)
+		buf.index = int32(i)
+		buf.ring = r
+
+		r.buffers[i] = buf
+	}
+
+	return r
+}
+
+func (r *Ring) prepareRead() *Buffer {
+	var rpos, wpos int32
+
+	for i := 0; i < 10; i++ {
+		rpos = atomic.LoadInt32(&r.rpos)
+		wpos = atomic.LoadInt32(&r.wpos)
+
+		if rpos == wpos {
+			if atomic.LoadInt32(&r.stop) == 1 {
+				return nil
+			}
+			runtime.Gosched()
+			continue
+		}
+
+		break
+	}
+
+	buffer := r.buffers[rpos]
+	buffer.prepareGet()
+	return buffer
+}
+
+func (r *Ring) Read(buf *Buffer) (e interface{}, next *Buffer) {
+	if buf == nil {
+		if buf = r.prepareRead(); buf == nil {
+			return nil, nil
+		}
+	}
+
+	for {
+		if e = buf.get(); e == nil {
+			if buf = r.prepareRead(); buf == nil {
+				return
+			}
+			continue
+		}
+		next = buf
+		return
+	}
+}
+
+func (r *Ring) ExitRead(buf *Buffer) {
+    buf.exitGet()
+}
+
+func (r *Ring) PrepareWrite() *Buffer {
+	buffer := r.buffers[r.wpos]
+	buffer.preparePut()
+	return buffer
+}
+
+func (r *Ring) Write(buf *Buffer, e interface{}) *Buffer {
+	if buf == nil {
+		buf = r.PrepareWrite()
+	}
+
+	for {
+		if err := buf.put(e); err != nil {
+			buf = r.NextWrite(buf)
+			continue
+		}
+		return buf
+	}
+}
+
+func (r *Ring) NextWrite(buf *Buffer) (next *Buffer) {
+	return buf.nextPut()
+}
+
+func (r *Ring) Stop(buf *Buffer) {
+	atomic.AddInt32(&r.stop, 1)
+	buf.finishPut()
+}
+
+type Buffer struct {
+	body     []interface{}
+	w        int32
+	r        int32
+	lock     sync.RWMutex
+	once     *sync.Once
+	index    int32 // Buffer在Ring数组中的下标
+	ring     *Ring
+	readonly int32
+}
+
+func newBuffer(size int) *Buffer {
+	buf := new(Buffer)
+	buf.body = make([]interface{}, size)
+	buf.once = new(sync.Once)
+	return buf
+}
+
+func (b *Buffer) lastDo() {
+	if b.index+1 == b.ring.size {
+		atomic.StoreInt32(&b.ring.rpos, 0)
+	} else {
+		atomic.StoreInt32(&b.ring.rpos, b.index+1)
+	}
+
+	atomic.SwapInt32(&b.readonly, 0)
+}
+
+func (b *Buffer) prepareGet() {
+	b.lock.RLock()
+}
+
+func (b *Buffer) finishGet() {
+	b.once.Do(b.lastDo)
+	b.lock.RUnlock()
+}
+
+func (b *Buffer) exitGet() {
+    b.lock.RUnlock()
+}
+
+func (b *Buffer) get() (e interface{}) {
+	defer func() {
+		if e == nil {
+			b.finishGet()
+		}
+	}()
+
+	if atomic.LoadInt32(&b.r) >= b.w {
+		return
+	}
+	newr := atomic.AddInt32(&b.r, 1)
+	if newr <= b.w {
+		e = b.body[newr-1]
+	}
+
+	return
+}
+
+func (b *Buffer) preparePut() {
+	for {
+		if atomic.LoadInt32(&b.readonly) == 0 {
+			break
+		}
+		// TODO fix sleep
+		time.Sleep(time.Millisecond * time.Duration(b.ring.size) / 2)
+	}
+	b.lock.Lock()
+	b.r = 0
+	b.w = 0
+	b.once = new(sync.Once)
+}
+
+func (b *Buffer) finishPut() {
+	atomic.AddInt32(&b.ring.wpos, 1)
+	atomic.CompareAndSwapInt32(&b.ring.wpos, b.ring.size, 0)
+
+	atomic.SwapInt32(&b.readonly, 1)
+	b.lock.Unlock()
+}
+
+func (b *Buffer) nextPut() *Buffer {
+	atomic.AddInt32(&b.ring.wpos, 1)
+	atomic.CompareAndSwapInt32(&b.ring.wpos, b.ring.size, 0)
+
+	next := b.ring.buffers[b.ring.wpos]
+	next.preparePut()
+
+	atomic.SwapInt32(&b.readonly, 1)
+	b.lock.Unlock()
+
+	return next
+}
+
+func (b *Buffer) put(e interface{}) error {
+	if int(b.w) >= len(b.body) {
+		return errors.New("full")
+	}
+
+	b.body[b.w] = e
+	b.w++
+
+	return nil
+}
