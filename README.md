@@ -1,7 +1,7 @@
 ringbuffer
 ==========
 
-ringbuffer是用来替代Go语言的channel，提高海量数据收发的性能
+ringbuffer是用来替代Go语言的channel，提高海量数据收发的性能。目前只支持一个写。
 
 
 #####使用方法
